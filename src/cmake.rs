@@ -7,6 +7,45 @@ struct NeoCMakeExt {
 }
 
 impl NeoCMakeExt {
+    fn find_cached_binary_on_drive(&self, exe_suffix: &str) -> Option<String> {
+        fs::read_dir(".")
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let dir_name = entry.file_name();
+                let dir_name = dir_name.to_string_lossy();
+
+                if !dir_name.starts_with("neocmakelsp-") {
+                    return None;
+                }
+
+                // Extract version part
+                let version_str = dir_name.strip_prefix("neocmakelsp-v")?;
+
+                // Parse version numbers
+                let mut parts = version_str.split('.');
+                let major = parts.next()?.parse::<u32>().ok()?;
+                let minor = parts.next()?.parse::<u32>().ok()?;
+                let patch = parts.next()?.parse::<u32>().ok()?;
+
+                // Ensure no extra parts
+                if parts.next().is_some() {
+                    return None;
+                }
+
+                let candidate = format!("{}/neocmakelsp{}", dir_name, exe_suffix);
+
+                fs::metadata(&candidate)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|_| ((major, minor, patch), candidate))
+            })
+            .max_by_key(|(version, _)| *version)
+            .map(|(_, path)| path)
+    }
+
     fn language_server_binary_path(
         &mut self,
         language_server_id: &LanguageServerId,
@@ -22,19 +61,35 @@ impl NeoCMakeExt {
             }
         }
 
+        let (platform, arch) = zed::current_platform();
+        let exe_suffix = match platform {
+            zed::Os::Windows => ".exe",
+            _ => "",
+        };
+
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
+
         let release = zed::latest_github_release(
             "Decodetalkers/neocmakelsp",
             zed::GithubReleaseOptions {
                 require_assets: true,
                 pre_release: false,
             },
-        )?;
+        );
 
-        let (platform, arch) = zed::current_platform();
+        let release = match release {
+            Ok(release) => release,
+            Err(e) => {
+                eprintln!("neocmakelsp: GitHub unreachable ({e}), looking for cached binary");
+                return self
+                    .find_cached_binary_on_drive(exe_suffix)
+                    .ok_or_else(|| format!("GitHub unreachable and no cached binary found: {e}"));
+            }
+        };
+
         let asset_name = match (platform, arch) {
             (zed::Os::Mac, _) => "neocmakelsp-universal-apple-darwin.tar.gz",
             (zed::Os::Windows, zed::Architecture::Aarch64) => {
@@ -68,13 +123,7 @@ impl NeoCMakeExt {
             .ok_or_else(|| format!("no asset found matching {:?}", asset_name))?;
 
         let version_dir = format!("neocmakelsp-{}", release.version);
-        let binary_path = format!(
-            "{version_dir}/neocmakelsp{}",
-            match platform {
-                zed::Os::Mac | zed::Os::Linux => "",
-                zed::Os::Windows => ".exe",
-            }
-        );
+        let binary_path = format!("{version_dir}/neocmakelsp{exe_suffix}"); // Line 65 moment
 
         if !fs::metadata(&binary_path).map_or(false, |stat| stat.is_file()) {
             zed::set_language_server_installation_status(
